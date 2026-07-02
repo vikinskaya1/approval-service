@@ -1,71 +1,73 @@
 # approval-service
 
-A backend service for approving/rejecting/cancelling content before publication.
-Content itself (publications, scenarios, edits, users, workspaces) lives in other
-services; this service only stores approval requests that reference them by
-opaque id.
+Backend-сервис для согласования контента (approve/reject/cancel) перед публикацией.
+Сам контент (публикации, сценарии, правки, пользователи, workspace'ы) живёт в других
+сервисах; этот сервис хранит только заявки на согласование, которые ссылаются на них
+по внешним (opaque) идентификаторам.
 
-Stack: **Python 3.12 + FastAPI + SQLAlchemy + Alembic**. SQLite for local/dev,
-PostgreSQL for docker-compose (works with either via `DATABASE_URL`).
+Стек: **Python 3.12 + FastAPI + SQLAlchemy + Alembic**. SQLite — для локального
+запуска/разработки, PostgreSQL — для docker-compose (работает с обеими БД через
+`DATABASE_URL`).
 
-## Run with Docker (recommended)
+## Запуск через Docker (рекомендуется)
 
 ```bash
 docker compose up --build
 ```
 
-This starts Postgres, runs Alembic migrations, and serves the API on
-`http://localhost:8000`. Health check: `curl http://localhost:8000/health`.
+Поднимется Postgres, применятся миграции Alembic, и API будет доступен на
+`http://localhost:8000`. Проверка: `curl http://localhost:8000/health`.
 
-## Run locally without Docker
+## Запуск локально без Docker
 
 ```bash
 python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 
-cp .env.example .env          # defaults to sqlite:///./approval_service.db
+cp .env.example .env          # по умолчанию используется sqlite:///./approval_service.db
 export $(cat .env | xargs)
 
 alembic upgrade head
 uvicorn app.main:app --reload
 ```
 
-## Run tests
+## Запуск тестов
 
 ```bash
 pip install -r requirements.txt
 pytest -v
 ```
 
-Tests spin up an isolated SQLite file per test (via `Base.metadata.create_all`,
-not Alembic, for speed) and never touch a shared database.
+Каждый тест поднимает изолированный файл SQLite (через `Base.metadata.create_all`,
+а не через Alembic — для скорости) и никогда не трогает общую/боевую базу данных.
 
-## Auth (local stub)
+## Авторизация (локальная заглушка)
 
-There's no real identity provider here. Every request must carry three headers
-that a real gateway/auth service would normally inject after validating a token:
+Реального провайдера идентификации здесь нет. Каждый запрос должен содержать три
+заголовка, которые в реальной системе обычно проставляет шлюз/сервис авторизации
+после проверки токена:
 
-| Header            | Meaning                                              |
-|--------------------|-------------------------------------------------------|
-| `X-User-Id`        | opaque external user id, e.g. `usr_1`                 |
-| `X-Workspace-Id`   | opaque external workspace id, e.g. `ws_1`              |
-| `X-Scopes`         | comma-separated list of granted scopes                |
+| Заголовок          | Значение                                              |
+|---------------------|--------------------------------------------------------|
+| `X-User-Id`        | внешний (opaque) идентификатор пользователя, напр. `usr_1` |
+| `X-Workspace-Id`   | внешний (opaque) идентификатор workspace, напр. `ws_1`     |
+| `X-Scopes`         | список прав через запятую                              |
 
-Scopes:
+Права доступа (scopes):
 
-| Scope              | Required for                          |
-|---------------------|----------------------------------------|
-| `approval:read`     | `GET` list / get                       |
-| `approval:create`   | `POST .../approval-requests`           |
-| `approval:decide`   | `POST .../approve`, `POST .../reject`  |
-| `approval:cancel`   | `POST .../cancel`                      |
+| Scope               | Требуется для                          |
+|----------------------|------------------------------------------|
+| `approval:read`     | `GET` списка / одной заявки              |
+| `approval:create`   | `POST .../approval-requests`             |
+| `approval:decide`   | `POST .../approve`, `POST .../reject`    |
+| `approval:cancel`   | `POST .../cancel`                        |
 
-The `workspace_id` in the URL **must** match `X-Workspace-Id`; a mismatch is
-rejected with `403` rather than silently scoping to the header's workspace,
-so a client can never accidentally (or intentionally) read/write a workspace
-its token wasn't issued for.
+`workspace_id` в URL **обязан** совпадать с `X-Workspace-Id`; при несовпадении
+запрос отклоняется с кодом `403`, а не молча обрабатывается в контексте workspace
+из заголовка. Это гарантирует, что клиент никогда не сможет (случайно или намеренно)
+прочитать/изменить данные workspace, для которого его токен не выдавался.
 
-Example:
+Пример:
 
 ```bash
 curl -X POST http://localhost:8000/api/v1/workspaces/ws_1/approval-requests \
@@ -83,13 +85,13 @@ curl -X POST http://localhost:8000/api/v1/workspaces/ws_1/approval-requests \
   }'
 ```
 
-## Idempotency
+## Идемпотентность
 
-Every state-changing endpoint (`create`, `approve`, `reject`, `cancel`) requires
-an `Idempotency-Key` header. Repeating the same request with the same key
-replays the original response instead of creating a duplicate approval
-request or applying a decision twice. Reusing a key with a different request
-body returns `409`. See `DESIGN.md` for details.
+Каждый изменяющий состояние эндпоинт (`create`, `approve`, `reject`, `cancel`)
+требует заголовок `Idempotency-Key`. Повторный запрос с тем же ключом возвращает
+исходный ответ вместо того, чтобы создать дубликат заявки или применить решение
+повторно. Повторное использование ключа с другим телом запроса возвращает `409`.
+Подробности — в `DESIGN.md`.
 
 ## API
 
@@ -105,6 +107,7 @@ POST /api/v1/workspaces/{workspace_id}/approval-requests/{request_id}/reject
 POST /api/v1/workspaces/{workspace_id}/approval-requests/{request_id}/cancel
 ```
 
-Interactive docs (Swagger UI) once running: `http://localhost:8000/docs`.
+Интерактивная документация (Swagger UI) при запущенном сервисе:
+`http://localhost:8000/docs`.
 
-See `DESIGN.md` for the data model, service boundaries, and known trade-offs.
+Модель данных, границы сервиса и известные компромиссы — см. `DESIGN.md`.
