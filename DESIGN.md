@@ -1,130 +1,145 @@
 # DESIGN
 
-## Data model
+## Модель данных
 
-**approval_requests** — the aggregate root.
+**approval_requests** — корневая сущность (aggregate root).
 - `id` (uuid), `workspace_id`
-- `source_type` (`publication|scenario|edit|external`), `source_id` — opaque
-  reference to the thing being approved; owned by other services
+- `source_type` (`publication|scenario|edit|external`), `source_id` — внешняя
+  ссылка на объект, который согласовывается; принадлежит другим сервисам
 - `title`, `description`
-- `reviewer_user_ids` (JSON list of opaque user ids)
-- `status`: `pending → {approved | rejected | cancelled}`. The three
-  non-pending states are final — once set, the row can never move again
-  (enforced in `crud._apply_decision`, not just in the API layer)
+- `reviewer_user_ids` (JSON-список внешних идентификаторов пользователей)
+- `status`: `pending → {approved | rejected | cancelled}`. Три нефинальных
+  статуса — финальные: как только один из них установлен, запись больше
+  никогда не может измениться (это проверяется в `crud._apply_decision`,
+  а не только на уровне API)
 - `created_by`, `created_at`, `updated_at`
 - `decided_by`, `decided_at`, `decision_comment` (approve), `decision_reason`
   (reject/cancel)
-- `version` — bumped on every decision; not currently used for
-  optimistic-concurrency checks from the client, but present so that can be
-  added later without a migration
+- `version` — увеличивается при каждом решении; сейчас не используется
+  клиентом для проверки оптимистичной блокировки, но заложено на будущее,
+  чтобы можно было добавить эту проверку без новой миграции
 
-**audit_logs** — one immutable row per state change (`created`, `approved`,
-`rejected`, `cancelled`), with `actor_user_id` and a small `details` JSON
-blob (comment/reason only — never raw provider data). This is the "who did
-what" trail the task asks for; it's append-only and never updated in place.
+**audit_logs** — по одной неизменяемой записи на каждое изменение состояния
+(`created`, `approved`, `rejected`, `cancelled`), с `actor_user_id` и
+небольшим JSON-блоком `details` (только комментарий/причина — никогда сырые
+данные от провайдеров). Это и есть след «кто и что изменил», который
+требуется в задании; таблица только для добавления записей, без изменения
+уже существующих.
 
-**outbox_events** — one row per state change, written in the same
-transaction as the change itself (transactional outbox pattern). See
-"Events / integration" below.
+**outbox_events** — по одной записи на каждое изменение состояния, пишется
+в той же транзакции, что и само изменение (паттерн transactional outbox).
+Подробнее — в разделе «События / интеграции» ниже.
 
-**idempotency_records** — see "Idempotency".
+**idempotency_records** — см. раздел «Идемпотентность».
 
-All four tables carry `workspace_id` directly (denormalized, not inferred by
-joining through `approval_requests`), so every query that must be
-workspace-scoped can filter on an indexed column without a join, including
-the audit and event tables.
+Все четыре таблицы напрямую хранят `workspace_id` (продублировано, а не
+выводится через join к `approval_requests`), поэтому любой запрос, который
+должен быть ограничен рамками workspace, может фильтроваться по
+индексированной колонке без join — включая таблицы аудита и событий.
 
-## Service boundaries
+## Границы сервиса
 
-This service owns *only* the approval workflow and its own audit/event
-trail. It does not:
-- store or fetch the actual publication/scenario/edit content — those stay
-  as opaque `sourceType`/`sourceId` pairs, resolved by whichever service
-  owns them;
-- store user or workspace records — `created_by`, `decided_by`,
-  `reviewer_user_ids`, `workspace_id` are all opaque foreign ids from other
-  systems, never joined against locally;
-- authenticate users — see the auth stub in `app/auth.py` and `README.md`.
-  In production this would be replaced by a dependency that verifies a real
-  token against an auth service/gateway, but the shape it produces
-  (`AuthContext(user_id, workspace_id, scopes)`) is exactly what the rest of
-  the code depends on, so swapping it is a one-file change.
+Этот сервис отвечает **только** за процесс согласования и собственный след
+аудита/событий. Он не делает следующего:
+- не хранит и не запрашивает сам контент публикации/сценария/правки — они
+  остаются opaque-парой `sourceType`/`sourceId`, которую резолвит тот
+  сервис, которому она принадлежит;
+- не хранит записи пользователей или workspace — `created_by`,
+  `decided_by`, `reviewer_user_ids`, `workspace_id` — все это внешние
+  opaque-идентификаторы из других систем, локально они никогда не
+  джойнятся;
+- не занимается аутентификацией пользователей — см. заглушку авторизации в
+  `app/auth.py` и `README.md`. В продакшене это будет заменено на
+  зависимость, которая проверяет реальный токен через сервис
+  авторизации/шлюз, но результат, который она отдаёт
+  (`AuthContext(user_id, workspace_id, scopes)`), — именно то, от чего
+  зависит весь остальной код, так что замена — это правка одного файла.
 
-Workspace isolation is enforced at two levels: every query filters
-`workspace_id`, *and* `get_auth_context` rejects any request where the URL's
-`workspace_id` doesn't match the caller's own `X-Workspace-Id` — so even a
-bug that forgot a `WHERE workspace_id = ...` clause somewhere would still be
-caught by the fact that a token for `ws_1` can't even address `ws_2`'s URLs.
+Изоляция workspace обеспечивается на двух уровнях: каждый запрос к БД
+фильтруется по `workspace_id`, **и** `get_auth_context` отклоняет любой
+запрос, где `workspace_id` в URL не совпадает с `X-Workspace-Id` вызывающей
+стороны — то есть даже если где-то в коде забыли бы условие `WHERE
+workspace_id = ...`, это всё равно было бы перехвачено тем, что токен для
+`ws_1` физически не может адресовать URL-адреса `ws_2`.
 
-## Handling repeated requests (idempotency)
+## Обработка повторных запросов (идемпотентность)
 
-Every state-changing endpoint requires an `Idempotency-Key` header, scoped
-per `(workspace_id, endpoint, idempotency_key)` — where "endpoint" for
-`approve`/`reject`/`cancel` includes the target `request_id`, so the same
-key value can be reused safely for a different request without colliding.
+Каждый изменяющий состояние эндпоинт требует заголовок `Idempotency-Key`,
+скоуп которого — `(workspace_id, endpoint, idempotency_key)`, где для
+`approve`/`reject`/`cancel` «endpoint» включает в себя ещё и целевой
+`request_id` — так один и тот же ключ можно безопасно переиспользовать для
+другой заявки без коллизий.
 
-Flow, in `app/idempotency.py`:
-1. Look up an existing record for the scope.
-2. If found and the stored request hash matches the incoming body: replay
-   the stored `(status_code, body)` — no business logic re-runs, no
-   duplicate row, no duplicate audit/event entry.
-3. If found but the hash differs: `409` — the same key was reused for a
-   materially different request, which is almost certainly a client bug.
-4. If not found: run the actual handler, then persist the result under that
-   key.
+Логика в `app/idempotency.py`:
+1. Ищем существующую запись для данного скоупа.
+2. Если найдена и хэш сохранённого запроса совпадает с текущим телом —
+   отдаём сохранённые `(status_code, body)` — бизнес-логика повторно не
+   выполняется, дубликат записи/аудита/события не создаётся.
+3. Если найдена, но хэш отличается — `409`: тот же ключ был переиспользован
+   для по сути другого запроса, что почти наверняка ошибка на стороне
+   клиента.
+4. Если не найдена — выполняем обработчик, затем сохраняем результат под
+   этим ключом.
 
-**Known trade-off:** the business-change commit (in `crud.py`) and the
-idempotency-record commit (in `idempotency.py`) are two separate
-transactions, not one. If the process crashes between them, a retry with
-the same key would re-run the handler once more. For `create`, `approve`,
-`reject`, `cancel` this is self-limiting rather than silently duplicating:
-`create` is the only one that could theoretically insert a second row in
-that narrow window (crash between committing the insert and committing the
-idempotency record). A stricter version would move the idempotency insert
-into the same transaction as the business change (or reserve the key
-row *before* running the handler, inside one transaction, using a `SELECT
-... FOR UPDATE`-style lock). Left out here to keep `crud.py` free of
-idempotency concerns and the diff small enough to review in a test task.
+**Известный компромисс:** коммит бизнес-изменения (в `crud.py`) и коммит
+записи идемпотентности (в `idempotency.py`) — это две отдельные
+транзакции, а не одна. Если процесс упадёт между ними, повтор с тем же
+ключом выполнит обработчик ещё раз. Для `create`, `approve`, `reject`,
+`cancel` это ограниченный по масштабу риск, а не тихое дублирование:
+теоретически создать вторую запись в этом узком окне может только
+`create` (падение между коммитом вставки и коммитом записи
+идемпотентности). Более строгий вариант — перенести запись идемпотентности
+в ту же транзакцию, что и бизнес-изменение (либо резервировать строку с
+ключом *до* выполнения обработчика внутри одной транзакции, например через
+блокировку в духе `SELECT ... FOR UPDATE`). Здесь это намеренно упрощено,
+чтобы не перегружать `crud.py` заботами об идемпотентности и оставить
+диффы достаточно небольшими для ревью тестового задания.
 
-## Events / integration
+## События / интеграции
 
-`outbox_events` is written in the *same* DB transaction as the state change
-it describes (`create_approval_request` / `_apply_decision` both `db.add()`
-the event row before the single `db.commit()`), which is what makes it
-usable as a transactional outbox: the event can never be "lost" relative to
-the state it describes, and it can never be published for a change that got
-rolled back.
+`outbox_events` записывается в **той же** транзакции БД, что и изменение
+состояния, которое она описывает (и `create_approval_request`, и
+`_apply_decision` делают `db.add()` для строки события до единственного
+`db.commit()`), и именно это делает её пригодной для использования как
+transactional outbox: событие никогда не может «потеряться» относительно
+описываемого им состояния и никогда не будет опубликовано для изменения,
+которое откатилось.
 
-This service does not publish to a broker itself — that's deliberately left
-to a separate worker/process that polls `outbox_events WHERE published =
-false`, forwards each row to whatever bus the rest of the system uses
-(Kafka, SQS, etc.), and marks it published. That keeps this service's
-runtime dependencies limited to its own database.
+Сам сервис не публикует события в брокер — это намеренно вынесено в
+отдельный worker/процесс, который опрашивает `outbox_events WHERE
+published = false`, пересылает каждую строку в ту шину, которая
+используется в остальной системе (Kafka, SQS и т.п.), и помечает её
+опубликованной. Это позволяет держать runtime-зависимости самого сервиса
+ограниченными только его собственной базой данных.
 
-Event types emitted: `approval_request.created`, `approval_request.approved`,
-`approval_request.rejected`, `approval_request.cancelled`. Payloads
-(`app/events.py`) only ever contain the same opaque ids and status fields
-already visible through the API — no secrets, tokens, emails, storage keys,
-signed URLs, provider URLs, or raw provider payloads exist anywhere in this
-service's data model, so there's nothing sensitive to accidentally leak
-through an event, a log line, or an error response. The global exception
-handler in `app/main.py` also makes sure an unexpected internal error
-returns a generic message rather than a stack trace or exception args that
-might embed a connection string.
+Публикуемые типы событий: `approval_request.created`,
+`approval_request.approved`, `approval_request.rejected`,
+`approval_request.cancelled`. Полезная нагрузка (`app/events.py`) содержит
+только те же opaque-идентификаторы и поля статуса, что уже видны через API
+— никаких секретов, токенов, email, storage keys, signed URLs, provider
+URLs или сырых provider payloads в модели данных этого сервиса нет вообще,
+поэтому просто нечему случайно утечь через событие, строку лога или ответ
+об ошибке. Глобальный обработчик исключений в `app/main.py` также следит
+за тем, чтобы непредвиденная внутренняя ошибка возвращала общее сообщение,
+а не стектрейс или аргументы исключения, которые могли бы содержать строку
+подключения к БД.
 
-## Known compromises / things a production version would add
+## Известные компромиссы / что добавить для продакшена
 
-- **Idempotency isn't fully transactional** with the business change (see
-  above).
-- **No pagination cursor** — `limit`/`offset` only; fine at this scale, but
-  `offset` pagination degrades on very large tables.
-- **No rate limiting / request size limits** — assumed to be handled by a
-  gateway in front of this service.
-- **`version` column is unused by clients today** — present for a future
-  optimistic-concurrency check (e.g. `If-Match`) if two reviewers race to
-  decide the same request; right now the DB-level "already final → 409"
-  check is what actually prevents a double-decision, which is sufficient
-  for the stated requirement but doesn't detect a race between two
-  *simultaneous* first decisions as cleanly as a version check would.
-- **Outbox publisher is out of scope** — this service writes the outbox
-  table; draining it to a real broker is a separate component by design.
+- **Идемпотентность не полностью транзакционна** относительно бизнес-
+  изменения (см. выше).
+- **Нет курсорной пагинации** — только `limit`/`offset`; для текущего
+  масштаба этого достаточно, но пагинация через `offset` деградирует на
+  очень больших таблицах.
+- **Нет rate limiting / ограничений на размер запроса** — предполагается,
+  что это обеспечивает шлюз перед сервисом.
+- **Колонка `version` пока не используется клиентами** — заложена под
+  будущую проверку оптимистичной блокировки (например, `If-Match`), если
+  два ревьюера одновременно решат по одной и той же заявке; сейчас именно
+  проверка «уже финальный статус → 409» на уровне БД реально предотвращает
+  двойное решение, чего достаточно для заявленного требования, но она не
+  отлавливает гонку между двумя *одновременными* первыми решениями так же
+  чисто, как это сделала бы проверка версии.
+- **Publisher для outbox вне зоны ответственности** — этот сервис пишет
+  таблицу outbox; её вычитывание в реальный брокер — отдельный компонент
+  по замыслу.
